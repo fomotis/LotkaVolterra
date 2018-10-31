@@ -1,0 +1,321 @@
+---
+title: "Fitting Lotka-Volterra Equation to Data"
+author: "Olusoji O. D."
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, echo=FALSE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.height = 6, fig.width = 14)
+```
+
+First, let's get in some data and select the columns that is of interest. First things are demonstrated with a small part of the dataset, then later extended to the whole dataset.
+
+```{r data, warning=FALSE, message=FALSE}
+library(minpack.lm)
+library(deSolve)
+library(tidyverse)
+library(knitr)
+library(gtable)
+wouter_data <- read.csv("Data/dataWouter181017.csv", stringsAsFactors = F)
+wouter_data <- wouter_data %>% dplyr::select(Strain, Treatment, Time = t, X)
+# Strain = 3 & Treatment = 23A
+expdata <- wouter_data %>% dplyr::filter(Strain == 3 & Treatment == "23A")
+```
+
+The codes below are to fit the **Lotka-Volterra (LVE)** equation for single specie to dataset using a combination of the tools in *tidyverse*, *desolve* and *minpack.lm* package in **R**.
+
+## The Lotka Volterra Equation
+The LVE can be written as;
+$$\frac{dx}{dt} = \mu x (1 - \frac{x}{K})$$ 
+where $\mu$ is the inherent growth rate per capita and $K$ is the carrying capacity. It can be rewritten as $$ \frac{dx}{dt} =  x (\mu - Ax) $$
+where $A$ is then the ratio $\frac{\mu}{K}$.
+
+### The LVE in R
+
+To fit this in **R**, let's start by writing the ODE above as a function to be solved by the *desolve* package.
+
+```{r LVE}
+LVE <- function(Time, X, parms, ...) {
+    #mu =  inherent growth per-capita
+    mu <- parms$mu
+    #A = ratio of mu and carrying capacity
+    A <- parms$A
+    dX <- X * (mu - (A * X))
+    list(dX)
+}
+
+```
+
+- Time is the time point of meaurement
+- X is the population at time $t$
+- parms is a vector of starting values for $\mu$ and $A$.
+
+### Starting Values
+
+Next is a function to obtain starting values for $\mu$ and $A$. Since $\mu$ is the inherent growth rate per capita, a good guess for this parameter will be any of the relative difference between $X_t$ and $X_{t +1 1}$ but let's go with the average of these relative difference. In the same vein, a good guess for $A$ will be the guessed value for $\mu$ and the maximum value of $X_t$. Hence, to guess starting values for $\mu$ and $A$, compute;
+
+$$\frac{X_{t + 1} - X_t}{X_t} \times \frac{Time_{t}}{Time_{t + 1}}$$
+which is the inherent per capita growth rates relative to time. The average of these is guessed as the starting value for $\mu$ while the ratio of this maximum to that of $X_t$ is guessed as starting value for $A$.
+
+```{r start_values}
+start_values <- sapply(1:nrow(expdata), function(i, x, y) {
+    if(i == NROW(y) | x[i] == 0) return(NA)
+      pcgr <- ((x[i + 1] - x[i]) / x[i]) / (y[i + 1] - y[i])
+    return(pcgr)
+  }, x = expdata$X, y = expdata$Time)
+start_values
+parms_start <- c(mu = mean(start_values, na.rm = T), 
+                 A = mean(start_values, na.rm = T) / max(expdata$X))
+parms_start
+```
+
+### Initial Fit
+
+Next, fit the ODE with the starting values obtained above. To do this, use the **ode()** function in the *desolve* package. The function takes 4 important inputs namely;
+
+* y = initial state of the ODE ($X_0$)
+* times = time sequnce for which we want a prediction
+* func = function depicting the ODE (LVE)
+* parms = values for the parameters in func
+
+```{r initial_fit}
+#value of X at the first time point
+x0 <- expdata$X[1]
+# a mix of a created time sequence with observed Time
+times <- sort(unique(c(seq(min(expdata$Time), max(expdata$Time), length = 100), 
+                       expdata$Time)))
+ini_fit <- ode(y = x0, times = times, func = LVE, parms = 
+                 list(A = parms_start[2], mu = parms_start[1]))
+ini_fit_df <- as.data.frame(ini_fit)
+names(ini_fit_df) <- c("Time", "X")
+
+#to be used later for likelihood computation
+ini_fit2 <- ode(y = x0, times = expdata$Time, func = LVE, parms = 
+                 list(A = parms_start[2], mu = parms_start[1]))
+ini_fit2_df <- as.data.frame(ini_fit2)
+names(ini_fit2_df) <- c("Time", "X")
+```
+
+Let's see where things are at the moment.
+
+```{r plot1}
+plot1 <- expdata %>% ggplot(aes(x = Time, y = X, group = 1)) + geom_point() + 
+  geom_line() + theme_minimal() + 
+  geom_line(data = ini_fit2_df, aes(x = Time, y = X), 
+            color = 1, linetype = "dashed", size = 1)
+print(plot1)
+```
+
+The black points are observed data points, while the dashed line are predicted values from the **ode()** function using the guessed parameter values. Looks like this is a good start. Things can be improved by minimizing the squared error between our current prediction from the **LVE** model and the observed values of $X$, which will lead to optimal parameter estimates.
+
+### Estimating $A$ and $\mu$
+
+To do this, let's write a function to get the residuals between the observed values and the predicted values. Then use the **nls.lm()** in the *minpack.lm* package. This function takes two important inputs namely;
+
+* par = a named vector of starting values for the parameters to be estimated
+* fn = a function that returns the residuals
+
+```{r final_fit}
+#function to return the residuals
+SSR <- function(parms) {
+   #parameters
+    A <- parms[2]
+    mu <- parms[1]
+    # 
+    ini_fit <- deSolve::ode(y = x0, times = times, func = LVE, 
+                            parms = list(A = A, mu = mu))
+    ini_fit_df <- as.data.frame(ini_fit)
+    names(ini_fit_df) <- c("Time", "X")
+    #filtering out data for observed time points
+    ini_fit_df2 <- ini_fit_df[ ini_fit_df$Time %in% expdata$Time, ]
+    #residual
+    ini_fit_df2$X - expdata$X
+}
+
+final_fit <- minpack.lm::nls.lm(par = parms_start, fn = SSR)
+#extracting the final estimates
+final_estimates <- coef(final_fit)
+#summary 
+final_fit_summary <- summary(final_fit)
+final_fit_summary
+```
+
+Now let's see what the final fit looks like. To do this, refit the ODE with the parameter estimates obtained from the **nls.lm()** function and plot against the observed dataset.
+
+
+```{r plot2}
+#predicted values from the final fit
+final_fit2 <- ode(y = x0, times = expdata$Time, func = LVE, parms = 
+                 list(A = final_estimates[2], mu = final_estimates[1]))
+final_fit_df <- as.data.frame(final_fit2)
+names(final_fit_df) <- c("Time", "X")
+
+expdata %>% ggplot(aes(x = Time, y = X, group = 1)) + geom_point() + 
+  geom_line() + theme_minimal() + 
+  geom_line(data = final_fit_df, aes(x = Time, y = X), 
+            color = "red", linetype = 4, size = 1)
+```
+
+To put it all into perspective;
+
+```{r}
+plot1 + geom_line(data = final_fit_df, aes(x = Time, y = X), 
+            color = "red", linetype = 4, size = 1)
+```
+The black dashed line was what we started with from the initial parameter guess, while the dashed red line was the fit obtained from minimizing the sum of squared error between the black line and the observed data points.
+
+### Inference and Fit Assessment
+
+It is normally of interest to compare models and since this approach doesn't involve building a likelihood, it becomes a little tricky to compare fit of models obtained via this approach. However there is a way out. In this part, we limit the discussion to model comparison involving loglikelihoods (likelihood ratio test and AIC).
+
+To obtain the loglikelihood of the models in question, we assume the observed data follows a normal distribution. Then the problem reduces to obtaining the loglikelihood at the estimated parameter values. To do this, we simply employ the **dnorm()** function. We plug in the observed data as the data points, the fitted values (these are typically mean values) from the final fit as the mean and then the estimated sigma (standard deviation of the residuals) from **minpack.lm()** as sigma. 
+
+Note that we returned log of the densities and summed it up, this is from $log(\prod_{i=1}^{n}x_i = \sum_{i=1}^{n} log(x_i)$. Let's do this for both the initial fit using our guessed values for the parameters and the final fit. It is important to stress that, for this to be valid, the dataset should remain the same, hence we used fitted values obtained from the observed time in the dataset and not the time sequence created for the initial fit (see the initial fit section).
+
+```{r modelfit}
+#likelihood of the initial fit
+loglike_initial <- sum(dnorm(x = expdata$X, mean = ini_fit2_df$X, 
+                             sd = final_fit_summary$sigma, log = T))
+loglike_initial
+#likelihood of the final fit
+loglike_final <- sum(dnorm(x = expdata$X, mean = final_fit_df$X, 
+                           sd = final_fit_summary$sigma, log = T))
+loglike_final
+
+### AIC = -2*loglikelihood + 2*npar. 
+#we treated sigma as a parameter to be estimated as well,
+#hence the need for + 1
+#initial fit
+AIC_initial <- (-2*loglike_initial) + (length(final_estimates) + 1)*2
+AIC_initial
+
+#final fit
+AIC_final <- (-2*loglike_final) + (length(final_estimates) + 1)*2
+AIC_final
+```
+
+
+So models can be compared if need be, it just requires the extra steps above.
+To summarise;
+
+1. write up the Lotka-Volterra equation as a function **(LVE)**
+2. guess starting vlaues for $A$ and $\mu$, we presented an approach to obtain good starting values
+3. perform an initial fit using **ode()** function from the *desolve* package
+4. write a function to obtain residuals using the observed data and fitted values from 3
+5. use **nls.lm()** function to estimate the optimum values for $A$ and $\mu$
+
+### Fit to Whole Dataset
+
+```{r }
+model_data <- wouter_data %>% group_by(Strain, Treatment) %>% nest()
+
+model_data$LVE_Fit <- map(model_data$data, function(.x) {
+  ddat <- as.data.frame(.x)
+  #starting values for the parameters
+  start_values <- sapply(1:nrow(.x), function(i, x, y) {
+    if(i == NROW(y) | x[i] == 0) return(NA)
+      pcgr <- ((x[i + 1] - x[i]) / x[i]) / (y[i + 1] - y[i])
+    return(pcgr)
+  }, x = ddat$X, y = ddat$Time)
+  parms_start <- c(mu = mean(start_values, na.rm = T), 
+                   A = mean(start_values, na.rm = T) / max(ddat$X))
+
+  # initial fit with the starting values above
+  x0 <- ddat$X[1]
+  ini_fit <- ode(y = x0, times = ddat$Time, func = LVE, parms = 
+                   list(A = parms_start[2], mu = parms_start[1]))
+  ini_fit_df <- as.data.frame(ini_fit)
+  names(ini_fit_df) <- c("Time", "X")
+  #ddat %>% ggplot(aes(x = Time, y = X), group = 1) + geom_point() +
+  #  geom_line(data = ini_fit_df, aes(x = Time, y = X))
+  #Final Fit
+    ##function to return the residuals
+    SSR <- function(parms) {
+      #parameters
+      A <- parms[2]
+      mu <- parms[1]
+      # 
+      ini_fit <- deSolve::ode(y = x0, times = ddat$Time, func = LVE, 
+                              parms = list(A = A, mu = mu))
+      ini_fit_df <- as.data.frame(ini_fit)
+      names(ini_fit_df) <- c("Time", "X")
+      #residual
+      ini_fit_df$X - ddat$X
+    }
+    final_fit <- minpack.lm::nls.lm(par = parms_start, fn = SSR, 
+                                    lower = c(-Inf, -1.0E-9))
+    #extracting the final estimates
+    final_estimates <- coef(final_fit)
+    #summary 
+    final_fit_summary <- summary(final_fit)
+    #predicted values for the final fits
+    final_fit2 <- ode(y = x0, times = ddat$Time, func = LVE, parms = 
+                 list(A = final_estimates[2], mu = final_estimates[1]))
+    final_fit_df <- as.data.frame(final_fit2)
+    names(final_fit_df) <- c("Time", "X")
+    return(list(PredictedValues = final_fit_df, 
+           Estimates = final_fit_summary$coefficients[, 1:2])
+    )
+})
+#separating things
+#predicted values in a column
+model_data$PredictedValues <- map(model_data$LVE_Fit, 
+                                  function(.x) return(.x$PredictedValues))
+#estimates in another column
+model_data$Estimates <- map(model_data$LVE_Fit, function(.x) {
+  return(cbind(Parameter = c("mu", "A"), 
+               as.data.frame(.x$Estimates)) )
+  })
+```
+
+
+
+### Plotting Fitted Values
+
+To plot the predicted values against the observed data for the whole dataset
+
+```{r }
+plotdata <- model_data %>% unnest(data, PredictedValues)
+allplots <- map(unique(plotdata$Strain), function(.x) {
+    ggplotGrob(plotdata %>% dplyr::filter(Strain == .x) %>% 
+      ggplot(aes(x = Time, group = Treatment, color = Treatment)) + 
+      geom_point(aes(y = X), shape = 19) + 
+      geom_line(aes(y = X1), size = 1) + 
+      theme_minimal() + ggtitle(paste0("Strain = ", .x)) + guides(colour = "none") +
+        theme(plot.title = element_text(hjust = 0.5))
+  )
+})
+allplots[[11]] <- ggplotGrob(plotdata %>% 
+                               dplyr::filter(Strain == 100) %>% 
+      ggplot(aes(x = Time, group = Treatment, color = Treatment)) + 
+      geom_point(aes(y = X), shape = 19) + 
+      geom_line(aes(y = X1), size = 1) + 
+      theme_minimal() + ggtitle(paste0("Strain = ", 100))  +
+        theme(plot.title = element_text(hjust = 0.5))
+)
+gridExtra::marrangeGrob(allplots, nrow = 3, ncol = 4)
+```
+
+
+### Plotting Estimated Parameter Values
+
+To extract the parameter estimates with trheir standard errors.
+
+```{r}
+Estimates_data <- model_data %>% unnest(Estimates)
+write_csv(Estimates_data, "Data/LotkaVolterraEstimates.csv")
+knitr::kable(Estimates_data[1:38, ], format = "markdown")
+
+knitr::kable(Estimates_data[39:77, ], format = "markdown")
+
+knitr::kable(Estimates_data[77:116, ], format = "markdown")
+```
+
+
+
+
+
+
+
